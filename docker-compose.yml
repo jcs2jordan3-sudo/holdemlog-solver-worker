@@ -1,0 +1,7 @@
+services:
+  worker:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    # TexasSolver는 트리당 ~1.6GB — 동시 1잡 직렬 처리 전제
+    mem_limit: 3g
