@@ -1,2 +1,5 @@
 .env
 __pycache__/
+e2e_result.json
+e2e_run*.log
+.pytest_cache/

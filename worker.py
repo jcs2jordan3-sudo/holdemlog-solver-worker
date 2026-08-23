@@ -1,8 +1,9 @@
 """HoldemLog 솔버 워커 — solver_jobs 큐를 폴링해 TexasSolver로 계산한다.
 
-스캐폴드 상태: 폴링 루프·CAS 선점·서브프로세스 실행 골격까지.
-hand_to_input()/parse_output()은 콘솔 입력 포맷 실측(README 체크리스트)
-후 채운다.
+파이프라인 (스트리트별 솔브, solver-worker-plan §2·§4):
+  잡 선점 → 핸드 로드 → 스트리트별 솔브 스펙 생성(converter)
+  → 콘솔 솔버 실행 → 덤프 워크로 히어로 결정 추출(parser)
+  → 빈도(전 스트리트) + EV/EV Loss(리버) → solver_results INSERT
 """
 
 import hashlib
@@ -14,12 +15,25 @@ import time
 
 import httpx
 
+from converter import (
+    ACCURACY,
+    ALLIN_THRESHOLD_BY_STREET,
+    BET_SIZES,
+    MAX_ITERATION,
+    RAISE_SIZES,
+    UnsupportedHand,
+    build_street_specs,
+    render_input,
+)
+from holdem import parse_cards
+from parser import finalize_spots, walk_street
+
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 # service_role 키 — RLS를 우회해 잡 상태 갱신·결과 기록. 워커 서버에만 둔다.
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 SOLVER_BIN = os.environ.get("SOLVER_BIN", "/opt/texassolver/console_solver")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))
-SOLVE_TIMEOUT = int(os.environ.get("SOLVE_TIMEOUT", "300"))  # 잡당 5분 상한
+SOLVE_TIMEOUT = int(os.environ.get("SOLVE_TIMEOUT", "300"))  # 스트리트당 상한
 
 HEADERS = {
     "apikey": SERVICE_KEY,
@@ -61,40 +75,76 @@ def claim_job(client: httpx.Client) -> dict | None:
 
 
 def spot_hash(hand: dict) -> str:
-    """동일 스팟 캐시 키 — 보드·유효스택·히어로 포지션·벳사이즈 설정.
+    """동일 스팟 캐시 키.
 
-    레인지는 포지션별 기본 레인지를 쓰므로 포지션이 곧 레인지 키가 된다.
+    보드·유효스택·히어로 카드/포지션·액션 라인·트리 설정이 모두 같아야
+    결과를 재사용할 수 있다 (결과 행이 히어로 콤보 기준이므로).
     """
     key = json.dumps(
         {
             "board": [hand.get("board_flop"), hand.get("board_turn"), hand.get("board_river")],
-            "stack": hand.get("effective_stack_bb"),
+            "stack": hand.get("effective_stack_bb") or hand.get("hero_stack_bb"),
             "hero": hand.get("hero_position"),
-            "sizes": [0.33, 0.75, "allin"],  # 트리 단순화 설정과 함께 갱신
+            "cards": hand.get("hero_cards"),
+            "table": hand.get("table_size"),
+            "line": [
+                [a.get("street"), a.get("position"), a.get("action"), a.get("amount_bb")]
+                for a in hand.get("actions", [])
+            ],
+            "tree": [BET_SIZES, RAISE_SIZES, ACCURACY, MAX_ITERATION, sorted(ALLIN_THRESHOLD_BY_STREET.items())],
         },
         sort_keys=True,
     )
     return hashlib.sha256(key.encode()).hexdigest()
 
 
-def hand_to_input(hand: dict, out_dir: str) -> str:
-    """핸드 JSON → TexasSolver 콘솔 입력 파일 경로.
+def solve_hand(hand: dict) -> list[dict]:
+    """핸드 하나를 스트리트별로 솔빙해 solver_results 행 목록을 만든다.
 
-    TODO(E2E): 콘솔 브랜치 문서로 입력 포맷 실측 후 구현 —
-    보드, 히어로/빌런 레인지(포지션별 기본 레인지 JSON), 유효스택,
-    벳 사이즈 33/75/올인, accuracy·max_iteration 설정.
+    (job_id/hand_id/spot_hash는 호출자가 채운다)
     """
-    raise NotImplementedError("콘솔 입력 포맷 실측 후 구현")
+    specs, ctx = build_street_specs(hand)
+    hero_cards = parse_cards(hand["hero_cards"])
+    solver_dir = os.path.dirname(SOLVER_BIN) or "."
+    rows: list[dict] = []
 
+    with tempfile.TemporaryDirectory() as tmp:
+        for spec in specs:
+            out_path = os.path.join(tmp, f"{spec.street}.json").replace("\\", "/")
+            in_path = os.path.join(tmp, f"{spec.street}.txt")
+            with open(in_path, "w", encoding="utf-8") as f:
+                f.write(render_input(spec, output_file=out_path))
+            subprocess.run(
+                [SOLVER_BIN, "-i", in_path],
+                check=True,
+                timeout=SOLVE_TIMEOUT,
+                cwd=solver_dir,
+                stdout=subprocess.DEVNULL,
+            )
+            with open(out_path, encoding="utf-8") as f:
+                dump = json.load(f)
 
-def parse_output(output_path: str, hand: dict) -> list[dict]:
-    """전략 JSON 덤프 → solver_results 행들.
-
-    TODO(E2E): 히어로가 실제로 한 액션 노드를 찾아 스트리트별
-    빈도(strategy_json)·EV(ev_json)·EV Loss(최선 EV - 실제 액션 EV)를
-    추출한다 (§8 표시 항목과 1:1).
-    """
-    raise NotImplementedError("전략 덤프 구조 실측 후 구현")
+            hero_seat = 0 if spec.hero_is_ip else 1
+            spots = walk_street(spec, dump, hero_seat, hero_cards)
+            finalize_spots(spec, spots, hand["hero_cards"])
+            for s in spots:
+                rows.append(
+                    {
+                        "street": s.street,
+                        "node_key": s.node_key,
+                        "strategy_json": {
+                            "actions": s.actions,
+                            "freqs": s.freqs,
+                            "actual": s.actual,
+                            "pot_bb": spec.pot,
+                            "effective_bb": spec.effective,
+                        },
+                        "ev_json": None if s.evs is None else {"actions": s.actions, "evs": s.evs},
+                        "hero_action": s.hero_label,
+                        "ev_loss_bb": s.ev_loss_bb,
+                    }
+                )
+    return rows
 
 
 def process(client: httpx.Client, job: dict) -> None:
@@ -106,32 +156,31 @@ def process(client: httpx.Client, job: dict) -> None:
     if not hand_rows:
         raise RuntimeError("핸드가 삭제됨")
     hand = hand_rows[0]
+    h = spot_hash(hand)
 
-    # 캐시 적중 시 재계산 생략
+    # 캐시 적중 시 재계산 없이 기존 결과 행을 새 잡으로 복제
     cached = client.get(
         rest("solver_results"),
         headers=HEADERS,
-        params={"spot_hash": f"eq.{spot_hash(hand)}", "limit": "1", "select": "id"},
+        params={"spot_hash": f"eq.{h}", "select": "*", "order": "created_at.asc"},
     ).json()
     if cached:
-        link_results = {"job_id": job["id"], "cached_from": cached[0]["id"]}
-        print(f"캐시 적중: {link_results}")
-        # TODO: 캐시 행 복제 또는 결과 참조 방식 확정 (0006 설계와 함께)
-        return
+        rows = [
+            {
+                k: r[k]
+                for k in ("street", "node_key", "strategy_json", "ev_json", "hero_action", "ev_loss_bb")
+            }
+            for r in cached
+            if r["job_id"] != job["id"]
+        ]
+        print(f"캐시 적중: {len(rows)}행 복제")
+    else:
+        rows = solve_hand(hand)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        input_path = hand_to_input(hand, tmp)
-        output_path = os.path.join(tmp, "strategy.json")
-        subprocess.run(
-            [SOLVER_BIN, "-i", input_path, "-o", output_path],
-            check=True,
-            timeout=SOLVE_TIMEOUT,
-        )
-        results = parse_output(output_path, hand)
-
-    for row in results:
-        row.update(job_id=job["id"], hand_id=job["hand_id"], spot_hash=spot_hash(hand))
-    client.post(rest("solver_results"), headers=HEADERS, json=results)
+    for row in rows:
+        row.update(job_id=job["id"], hand_id=job["hand_id"], spot_hash=h)
+    if rows:
+        client.post(rest("solver_results"), headers=HEADERS, json=rows)
 
 
 def main() -> None:
@@ -147,6 +196,9 @@ def main() -> None:
                 try:
                     process(client, job)
                     status = {"status": "done", "finished_at": "now()"}
+                except UnsupportedHand as e:
+                    print(f"미지원 핸드: {e}")
+                    status = {"status": "failed", "error": str(e), "finished_at": "now()"}
                 except Exception as e:  # noqa: BLE001 — 잡 단위 격리
                     print(f"잡 실패: {e}")
                     status = {"status": "failed", "error": str(e)[:500], "finished_at": "now()"}
