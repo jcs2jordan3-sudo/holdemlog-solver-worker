@@ -3,5 +3,6 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
-    # TexasSolver는 트리당 ~1.6GB — 동시 1잡 직렬 처리 전제
-    mem_limit: 3g
+    # 플랍 솔브 실측 ~9GB (2026-08-23, 4스레드) — 동시 1잡 직렬 처리 전제.
+    # VPS RAM + 스왑 합계 이하로 맞춘다 (8GB RAM + 4GB 스왑 기준 10g)
+    mem_limit: 10g
