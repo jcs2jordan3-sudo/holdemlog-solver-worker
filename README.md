@@ -1,5 +1,10 @@
 # holdemlog-solver-worker
 
+> **상태 (2026-09-04)**: HoldemLog 앱의 Solver Review는 이 워커 대신
+> Supabase Edge Function + Claude(LLM) 분석으로 운영 중이다. 이 저장소는
+> TexasSolver 기반 정밀 경로가 다시 필요할 때를 위해 완성된 상태로 보관한다
+> (로컬 E2E까지 검증됨, VPS 배포는 하지 않았음).
+
 HoldemLog 앱의 Solver Review(§8)를 계산하는 **독립 워커 서비스**.
 [TexasSolver](https://github.com/bupticybee/TexasSolver)(AGPL-3.0)를 Docker
 이미지 안에서 소스 빌드해 서브프로세스로 실행하고, Supabase `solver_jobs`
